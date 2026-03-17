@@ -3,11 +3,13 @@ from pathlib import Path
 from typing import Generator, List
 
 import pandas as pd
-from fastapi import FastAPI, File, UploadFile
+from fastapi import Depends, FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.responses import FileResponse, RedirectResponse
 
-from database.mongo import MongoStore
+from database.db import SessionLocal, init_db
+from database.models import Report, ReceivableRow
+from output.export_excel import export_all
 from output.export_pdf import export_pdf
 from parser.pdf_reader import read_pdf
 from parser.pipeline import run_full_pipeline
@@ -17,16 +19,17 @@ from utils.static_dashboard import dashboard_html
 
 logger = get_logger(__name__)
 
+init_db()
+
 app = FastAPI(title="PDF Receivable Parser")
 
-_store: MongoStore | None = None
 
-
-def store() -> MongoStore:
-    global _store
-    if _store is None:
-        _store = MongoStore()
-    return _store
+def get_db() -> Generator:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def _extract_header_and_range(raw_text: str) -> tuple[str | None, str | None]:
@@ -103,75 +106,147 @@ async def index() -> str:
 
 
 @app.get("/dashboard/{report_id}", response_class=HTMLResponse)
-async def dashboard(report_id: str) -> str:
+async def dashboard(report_id: int) -> str:
     return dashboard_html()
 
 
 @app.get("/reports/{report_id}")
-async def get_report(report_id: str):
-    rpt = store().get_report(report_id)
+async def get_report(report_id: int, db=Depends(get_db)):
+    rpt = db.query(Report).filter(Report.id == report_id).first()
     if not rpt:
         return JSONResponse({"error": "Report not found"}, status_code=404)
-    return rpt
+    return {
+        "id": rpt.id,
+        "filename": rpt.filename,
+        "header": rpt.header,
+        "date_range": rpt.date_range,
+        "created_at": rpt.created_at.isoformat(),
+    }
 
 
 @app.get("/reports/{report_id}/rows")
-async def get_rows(report_id: str):
-    return store().list_rows(report_id)
+async def get_rows(report_id: int, db=Depends(get_db)):
+    rows = (
+        db.query(ReceivableRow)
+        .filter(ReceivableRow.report_id == report_id)
+        .order_by(ReceivableRow.region.asc(), ReceivableRow.customer_name.asc())
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "report_id": r.report_id,
+            "region": r.region,
+            "customer_name": r.customer_name,
+            "payment_status": r.payment_status,
+            "safe": r.safe,
+            "warning": r.warning,
+            "danger": r.danger,
+            "doubtful": r.doubtful,
+            "total": r.total,
+        }
+        for r in rows
+    ]
 
 
 @app.post("/rows/{row_id}/move")
-async def move_amount(row_id: str, payload: dict):
-    try:
-        from_bucket = payload.get("from_bucket")
-        to_bucket = payload.get("to_bucket")
-        amount = float(payload.get("amount", 0) or 0)
-        ok = store().move_amount(row_id, from_bucket=from_bucket, to_bucket=to_bucket, amount=amount)
-    except ValueError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
-
-    if not ok:
+async def move_amount(row_id: int, payload: dict, db=Depends(get_db)):
+    row = db.query(ReceivableRow).filter(ReceivableRow.id == row_id).first()
+    if not row:
         return JSONResponse({"error": "Row not found"}, status_code=404)
+
+    from_bucket = payload.get("from_bucket")
+    to_bucket = payload.get("to_bucket")
+    amount = float(payload.get("amount", 0) or 0)
+    if from_bucket not in {"safe", "warning", "danger", "doubtful"}:
+        return JSONResponse({"error": "Invalid from_bucket"}, status_code=400)
+    if to_bucket not in {"safe", "warning", "danger", "doubtful"}:
+        return JSONResponse({"error": "Invalid to_bucket"}, status_code=400)
+    if amount <= 0:
+        return JSONResponse({"error": "Amount must be > 0"}, status_code=400)
+
+    current_from = float(getattr(row, from_bucket) or 0.0)
+    amt = min(amount, current_from)
+    setattr(row, from_bucket, current_from - amt)
+    setattr(row, to_bucket, float(getattr(row, to_bucket) or 0.0) + amt)
+    row.total = float(row.safe or 0) + float(row.warning or 0) + float(row.danger or 0) + float(row.doubtful or 0)
+    db.commit()
     return {"ok": True, "row_id": row_id}
 
 
 @app.patch("/rows/{row_id}/payment-status")
-async def set_payment_status(row_id: str, payload: dict):
+async def set_payment_status(row_id: int, payload: dict, db=Depends(get_db)):
+    row = db.query(ReceivableRow).filter(ReceivableRow.id == row_id).first()
+    if not row:
+        return JSONResponse({"error": "Row not found"}, status_code=404)
     status = payload.get("payment_status")
     if status not in {"Paid", "Unpaid", "Partially Paid"}:
         return JSONResponse({"error": "Invalid payment_status"}, status_code=400)
-    ok = store().set_payment_status(row_id, status=status)
-    if not ok:
-        return JSONResponse({"error": "Row not found"}, status_code=404)
+    row.payment_status = status
+    db.commit()
     return {"ok": True}
 
 
 @app.post("/rows/{row_id}/set")
-async def set_row(row_id: str, payload: dict):
-    ok = store().set_row(row_id, payload)
-    if not ok:
+async def set_row(row_id: int, payload: dict, db=Depends(get_db)):
+    row = db.query(ReceivableRow).filter(ReceivableRow.id == row_id).first()
+    if not row:
         return JSONResponse({"error": "Row not found"}, status_code=404)
+    for key in ["safe", "warning", "danger", "doubtful"]:
+        if key in payload:
+            setattr(row, key, float(payload[key] or 0.0))
+    if "payment_status" in payload:
+        row.payment_status = payload["payment_status"] or "Unpaid"
+    row.total = float(row.safe or 0) + float(row.warning or 0) + float(row.danger or 0) + float(row.doubtful or 0)
+    db.commit()
     return {"ok": True}
 
 
 @app.post("/reports/{report_id}/reset")
-async def reset_report(report_id: str):
-    ok = store().reset_report(report_id)
-    if not ok:
+async def reset_report(report_id: int, db=Depends(get_db)):
+    rows = db.query(ReceivableRow).filter(ReceivableRow.report_id == report_id).all()
+    if not rows:
         return JSONResponse({"error": "Report not found or has no rows"}, status_code=404)
+    for r in rows:
+        r.safe = r.original_safe
+        r.warning = r.original_warning
+        r.danger = r.original_danger
+        r.doubtful = r.original_doubtful
+        r.total = r.original_total
+        r.payment_status = "Unpaid"
+    db.commit()
     return {"ok": True}
 
 
 @app.get("/reports/{report_id}/export/{fmt}")
-async def export_report(report_id: str, fmt: str):
-    rpt = store().get_report(report_id)
+async def export_report(report_id: int, fmt: str, db=Depends(get_db)):
+    rpt = db.query(Report).filter(Report.id == report_id).first()
     if not rpt:
         return JSONResponse({"error": "Report not found"}, status_code=404)
 
-    rows = store().list_rows(report_id)
-    df = pd.DataFrame(rows)
+    rows = (
+        db.query(ReceivableRow)
+        .filter(ReceivableRow.report_id == report_id)
+        .order_by(ReceivableRow.region.asc(), ReceivableRow.customer_name.asc())
+        .all()
+    )
+    df = pd.DataFrame(
+        [
+            {
+                "region": r.region,
+                "customer_name": r.customer_name,
+                "payment_status": r.payment_status,
+                "safe": r.safe,
+                "warning": r.warning,
+                "danger": r.danger,
+                "doubtful": r.doubtful,
+                "total": r.total,
+            }
+            for r in rows
+        ]
+    )
 
-    export_dir = Path("/tmp") / "exports" / f"report_{report_id}"
+    export_dir = Path("exports") / f"report_{report_id}"
     export_dir.mkdir(parents=True, exist_ok=True)
 
     if fmt == "csv":
@@ -188,7 +263,7 @@ async def export_report(report_id: str, fmt: str):
         return FileResponse(p)
     if fmt == "pdf":
         p = export_dir / "receivables.pdf"
-        export_pdf(df, p, title=rpt.get("header") or "Receivables", subtitle=rpt.get("date_range"))
+        export_pdf(df, p, title=rpt.header or "Receivables", subtitle=rpt.date_range)
         return FileResponse(p, media_type="application/pdf", filename=p.name)
 
     return JSONResponse({"error": "Unsupported format"}, status_code=400)
@@ -197,14 +272,15 @@ async def export_report(report_id: str, fmt: str):
 @app.post("/upload")
 async def upload_file(
     file: UploadFile = File(...),
+    db=Depends(get_db),
 ):
     if file.content_type != "application/pdf":
         return HTMLResponse(
             content="<h3>Only PDF files are supported.</h3>", status_code=400
         )
 
-    upload_dir = Path("/tmp") / "uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    upload_dir = Path("uploads")
+    upload_dir.mkdir(exist_ok=True)
     pdf_path = upload_dir / f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{file.filename}"
 
     with open(pdf_path, "wb") as f:
@@ -220,29 +296,58 @@ async def upload_file(
 
     df, summary = run_full_pipeline(str(pdf_path), export_dir="exports")
 
-    report_id = store().create_report(
+    report = Report(
         filename=file.filename,
         header=header_line or "PURPLE PATCH FARMS INTERNATIONAL PVT.LTD -FARM",
         date_range=date_range_line,
     )
+    db.add(report)
+    db.commit()
+    db.refresh(report)
 
-    rows_payload = df.to_dict(orient="records")
-    store().insert_rows(report_id, rows_payload)
+    db_rows: List[ReceivableRow] = []
+    for _, r in df.iterrows():
+        safe = float(r.get("safe", 0.0) or 0.0)
+        warning = float(r.get("warning", 0.0) or 0.0)
+        danger = float(r.get("danger", 0.0) or 0.0)
+        doubtful = float(r.get("doubtful", 0.0) or 0.0)
+        total = float(r.get("total", safe + warning + danger + doubtful) or 0.0)
+        db_rows.append(
+            ReceivableRow(
+                report_id=report.id,
+                region=str(r.get("region") or "Unknown"),
+                customer_name=str(r.get("customer_name") or "").strip(),
+                payment_status="Unpaid",
+                safe=safe,
+                warning=warning,
+                danger=danger,
+                doubtful=doubtful,
+                total=total,
+                original_safe=safe,
+                original_warning=warning,
+                original_danger=danger,
+                original_doubtful=doubtful,
+                original_total=total,
+            )
+        )
+    db.add_all(db_rows)
+    db.commit()
 
-    return RedirectResponse(url=f"/dashboard/{report_id}", status_code=303)
+    return RedirectResponse(url=f"/dashboard/{report.id}", status_code=303)
 
 
 @app.post("/upload-json")
 async def upload_json(
     file: UploadFile = File(...),
+    db=Depends(get_db),
 ):
     if file.content_type != "application/pdf":
         return JSONResponse(
             content={"error": "Only PDF files are supported."}, status_code=400
         )
 
-    upload_dir = Path("/tmp") / "uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    upload_dir = Path("uploads")
+    upload_dir.mkdir(exist_ok=True)
     pdf_path = upload_dir / f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{file.filename}"
 
     with open(pdf_path, "wb") as f:
@@ -256,18 +361,49 @@ async def upload_json(
 
     df, summary = run_full_pipeline(str(pdf_path), export_dir=None)
 
-    report_id = store().create_report(
+    report = Report(
         filename=file.filename,
         header=header_line or "PURPLE PATCH FARMS INTERNATIONAL PVT.LTD -FARM",
         date_range=date_range_line,
     )
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+
+    db_rows: List[ReceivableRow] = []
+    for _, r in df.iterrows():
+        safe = float(r.get("safe", 0.0) or 0.0)
+        warning = float(r.get("warning", 0.0) or 0.0)
+        danger = float(r.get("danger", 0.0) or 0.0)
+        doubtful = float(r.get("doubtful", 0.0) or 0.0)
+        total = float(r.get("total", safe + warning + danger + doubtful) or 0.0)
+        db_rows.append(
+            ReceivableRow(
+                report_id=report.id,
+                region=str(r.get("region") or "Unknown"),
+                customer_name=str(r.get("customer_name") or "").strip(),
+                payment_status="Unpaid",
+                safe=safe,
+                warning=warning,
+                danger=danger,
+                doubtful=doubtful,
+                total=total,
+                original_safe=safe,
+                original_warning=warning,
+                original_danger=danger,
+                original_doubtful=doubtful,
+                original_total=total,
+            )
+        )
+    db.add_all(db_rows)
+    db.commit()
 
     return {
-        "report_id": report_id,
+        "report_id": report.id,
         "rows_extracted": summary["rows_extracted"],
         "regions_detected": summary["regions_detected"],
         "total_value": summary["total_value"],
-        "header": header_line or "PURPLE PATCH FARMS INTERNATIONAL PVT.LTD -FARM",
-        "date_range": date_range_line,
+        "header": report.header,
+        "date_range": report.date_range,
     }
 

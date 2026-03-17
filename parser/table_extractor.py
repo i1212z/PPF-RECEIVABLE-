@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import List, Dict, Any
 
+import camelot
 import pandas as pd
 
 from utils.logger import get_logger
@@ -14,12 +15,6 @@ def extract_tables(path: str) -> List[pd.DataFrame]:
     Use Camelot to extract tables from all pages.
     On failure, return empty list and let text parser handle everything.
     """
-    try:
-        import camelot  # type: ignore
-    except Exception as exc:
-        logger.info("Camelot not available (%s). Skipping table extraction.", exc)
-        return []
-
     pdf_path = Path(path)
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
