@@ -8,7 +8,9 @@ paddleocr
 paddlepaddle
 pandas
 numpy
-sqlalchemy
 python-multipart
 regex
 reportlab
+gunicorn
+pymongo
+openpyxl
