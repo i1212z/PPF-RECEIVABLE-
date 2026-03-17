@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -18,8 +17,6 @@ from vision.qwen_validator import validate_with_qwen
 
 
 logger = get_logger(__name__)
-
-os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 
 def _rows_from_camelot_tables(
@@ -197,17 +194,18 @@ def run_full_pipeline(pdf_path: str, export_dir: str | Path | None = None) -> Tu
         else:
             candidate_rows = text_rows
 
-    # 3) If we have very few rows, trigger OCR+PaddleOCR as a fallback (lazy import)
+    # 3) Optional OCR fallback (only if dependencies are available)
     if len(candidate_rows) < 5:
-        logger.info(
-            "Low row count (%s) from text/Camelot; triggering PaddleOCR fallback.",
-            len(candidate_rows),
-        )
         try:
             from ocr.paddle_ocr_reader import pdf_to_ocr_boxes
-
+        except Exception as exc:
+            logger.info("OCR fallback not available (%s). Skipping OCR.", exc)
+        else:
+            logger.info(
+                "Low row count (%s) from text/Camelot; triggering OCR fallback.",
+                len(candidate_rows),
+            )
             ocr_boxes = pdf_to_ocr_boxes(pdf_path)
-            # For now, we only reuse text from OCR (concatenated lines)
             ocr_lines: List[str] = []
             for _, items in ocr_boxes:
                 for txt, _ in items:
@@ -215,13 +213,11 @@ def run_full_pipeline(pdf_path: str, export_dir: str | Path | None = None) -> Tu
             ocr_rows = parse_receivable_lines(ocr_lines)
             if len(ocr_rows) > len(candidate_rows):
                 logger.info(
-                    "Using PaddleOCR-derived rows (%s) over previous (%s).",
+                    "Using OCR-derived rows (%s) over previous (%s).",
                     len(ocr_rows),
                     len(candidate_rows),
                 )
                 candidate_rows = ocr_rows
-        except Exception as exc:  # noqa: BLE001
-            logger.info("PaddleOCR not available; skipping OCR fallback (%s).", exc)
 
     # 4) Vision validation hook – no-op placeholder, but structured for production
     #    You would pass per-page images and rows to Qwen2.5-VL here.

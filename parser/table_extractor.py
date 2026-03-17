@@ -1,7 +1,6 @@
 from pathlib import Path
 from typing import List, Dict, Any
 
-import camelot
 import pandas as pd
 
 from utils.logger import get_logger
@@ -18,6 +17,12 @@ def extract_tables(path: str) -> List[pd.DataFrame]:
     pdf_path = Path(path)
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    try:
+        import camelot  # type: ignore
+    except Exception as exc:
+        logger.info("Camelot not available (%s). Skipping table extraction.", exc)
+        return []
 
     try:
         tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="lattice")

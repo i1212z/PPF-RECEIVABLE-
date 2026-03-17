@@ -1,13 +1,12 @@
 fastapi
 uvicorn
 pdfplumber
-camelot-py
-opencv-python
 pandas
 numpy
+sqlalchemy
+psycopg2-binary
 python-multipart
 regex
 reportlab
 gunicorn
-pymongo
 openpyxl

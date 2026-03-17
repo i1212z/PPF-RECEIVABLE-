@@ -1,6 +1,6 @@
 # PPF-RECEIVABLE-
 
-## Deploy on Render + MongoDB
+## Deploy on Render + Postgres (recommended)
 
 ### Render service
 
@@ -11,6 +11,4 @@ This repo includes a `render.yaml` blueprint you can use to create the service.
 
 ### Required env vars
 
-- **`MONGODB_URI`**: Mongo connection string
-- **`MONGODB_DB`**: optional DB name (default: `ppf_receivable`)
-- **`DATA_DIR`**: optional writable path for uploads/exports (default: `/tmp`)
+- **`DATABASE_URL`**: set automatically by Render when you attach a Render Postgres database
