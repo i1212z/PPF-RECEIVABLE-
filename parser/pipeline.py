@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import pandas as pd
+from dataclasses import asdict
 
 from output.export_excel import export_all
 from parser.pdf_reader import read_pdf
@@ -18,9 +18,6 @@ from vision.qwen_validator import validate_with_qwen
 
 
 logger = get_logger(__name__)
-
-os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-
 
 def _rows_from_camelot_tables(
     dfs: List[pd.DataFrame],
