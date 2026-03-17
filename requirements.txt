@@ -3,9 +3,6 @@ uvicorn
 pdfplumber
 camelot-py
 opencv-python
-pdf2image
-paddleocr
-paddlepaddle
 pandas
 numpy
 python-multipart
