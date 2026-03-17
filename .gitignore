@@ -13,3 +13,7 @@ exports/
 logs/
 
 *.pdf
+
+# Never commit local SSH keys
+id_ed25519_zubair
+id_ed25519_zubair.pub
